@@ -5,6 +5,7 @@ import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.ebookreader.data.database.dao.BookDao
+import com.example.ebookreader.data.parser.EpubParser
 import com.example.ebookreader.data.preferences.ReadingPreferences
 import com.example.ebookreader.domain.model.Book
 import com.example.ebookreader.presentation.ui.reader.ReadingUiState
@@ -23,7 +24,8 @@ import javax.inject.Inject
 class ReadingViewModel @Inject constructor(
     private val bookDao: BookDao,
     @ApplicationContext private val context: Context,
-    private val readingPreferences: ReadingPreferences
+    private val readingPreferences: ReadingPreferences,
+    private val epubParser: EpubParser
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow<ReadingUiState>(ReadingUiState.Loading)
@@ -97,7 +99,7 @@ class ReadingViewModel @Inject constructor(
 
                 currentBook = book
 
-                // Load book content
+                // Load book content based on format
                 bookContent = loadBookContent(book) ?: "Could not load book content"
 
                 // Load saved preferences
@@ -232,10 +234,154 @@ class ReadingViewModel @Inject constructor(
         }
     }
 
+    // Enhanced content loading with full format support
+    private suspend fun loadBookContent(book: Book): String? {
+        return try {
+            when (book.format) {
+                com.example.ebookreader.domain.model.BookFormat.TXT -> {
+                    loadTextFile(book)
+                }
+                com.example.ebookreader.domain.model.BookFormat.EPUB -> {
+                    loadEpubContent(book)
+                }
+                com.example.ebookreader.domain.model.BookFormat.PDF -> {
+                    // PDF support - placeholder for now
+                    "PDF reading support coming soon!\n\nFile: ${book.title}\nAuthor: ${book.author}\n\nThis feature will be added in a future update with proper PDF rendering and text extraction."
+                }
+                com.example.ebookreader.domain.model.BookFormat.MOBI -> {
+                    "MOBI reading support coming soon!\n\nFile: ${book.title}\nAuthor: ${book.author}\n\nMOBI format support will be added in a future update."
+                }
+                com.example.ebookreader.domain.model.BookFormat.FB2 -> {
+                    "FB2 reading support coming soon!\n\nFile: ${book.title}\nAuthor: ${book.author}\n\nFB2 format support will be added in a future update."
+                }
+                com.example.ebookreader.domain.model.BookFormat.HTML -> {
+                    loadHtmlFile(book)
+                }
+                com.example.ebookreader.domain.model.BookFormat.MD -> {
+                    loadMarkdownFile(book)
+                }
+                else -> {
+                    "This ${book.format.extension.uppercase()} file format is not yet fully supported.\n\nFilename: ${book.title}\nAuthor: ${book.author}\n\nSupported formats: TXT, EPUB, HTML, MD\nComing soon: PDF, MOBI, FB2"
+                }
+            }
+        } catch (e: Exception) {
+            "Error loading content: ${e.message}\n\nPlease try reimporting this book from the library."
+        }
+    }
+
+    private suspend fun loadTextFile(book: Book): String? {
+        return if (book.filePath.startsWith("/")) {
+            // New system: file stored in app-private storage
+            val file = File(book.filePath)
+            if (file.exists()) {
+                file.readText()
+            } else {
+                "File not found. The book may have been moved or deleted."
+            }
+        } else {
+            // Old system: URI-based (try with permissions)
+            val uri = Uri.parse(book.fileUri ?: book.filePath)
+
+            try {
+                context.contentResolver.takePersistableUriPermission(
+                    uri,
+                    android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            } catch (e: Exception) {
+                // Permission not available
+            }
+
+            val inputStream = context.contentResolver.openInputStream(uri)
+            inputStream?.bufferedReader()?.use { it.readText() }
+                ?: "Could not read file. Please reimport this book from the library."
+        }
+    }
+
+    private suspend fun loadEpubContent(book: Book): String? {
+        return try {
+            val epubContent = if (book.filePath.startsWith("/")) {
+                // File stored in app-private storage
+                epubParser.parseEpubFromFile(book.filePath)
+            } else {
+                // URI-based
+                val uri = Uri.parse(book.fileUri ?: book.filePath)
+                epubParser.parseEpub(context, uri)
+            }
+
+            epubContent?.fullText ?: "Could not parse EPUB content. The file may be corrupted or use an unsupported EPUB variant."
+        } catch (e: Exception) {
+            e.printStackTrace()
+            "Error parsing EPUB: ${e.message}\n\nPlease ensure this is a valid EPUB file and try reimporting."
+        }
+    }
+
+    private suspend fun loadHtmlFile(book: Book): String? {
+        return try {
+            val htmlContent = if (book.filePath.startsWith("/")) {
+                val file = File(book.filePath)
+                if (file.exists()) file.readText() else null
+            } else {
+                val uri = Uri.parse(book.fileUri ?: book.filePath)
+                context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
+            }
+
+            htmlContent?.let { extractTextFromHtml(it) }
+                ?: "Could not read HTML file."
+        } catch (e: Exception) {
+            "Error loading HTML: ${e.message}"
+        }
+    }
+
+    private suspend fun loadMarkdownFile(book: Book): String? {
+        return try {
+            val markdownContent = if (book.filePath.startsWith("/")) {
+                val file = File(book.filePath)
+                if (file.exists()) file.readText() else null
+            } else {
+                val uri = Uri.parse(book.fileUri ?: book.filePath)
+                context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
+            }
+
+            markdownContent?.let { convertMarkdownToText(it) }
+                ?: "Could not read Markdown file."
+        } catch (e: Exception) {
+            "Error loading Markdown: ${e.message}"
+        }
+    }
+
+    private fun extractTextFromHtml(html: String): String {
+        return html
+            .replace(Regex("<script[^>]*>.*?</script>", RegexOption.DOT_MATCHES_ALL), "")
+            .replace(Regex("<style[^>]*>.*?</style>", RegexOption.DOT_MATCHES_ALL), "")
+            .replace(Regex("<[^>]+>"), "")
+            .replace(Regex("&nbsp;"), " ")
+            .replace(Regex("&amp;"), "&")
+            .replace(Regex("&lt;"), "<")
+            .replace(Regex("&gt;"), ">")
+            .replace(Regex("&quot;"), "\"")
+            .replace(Regex("&#39;"), "'")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+    }
+
+    private fun convertMarkdownToText(markdown: String): String {
+        return markdown
+            .replace(Regex("^#{1,6}\\s+", RegexOption.MULTILINE), "") // Headers
+            .replace(Regex("\\*\\*(.*?)\\*\\*"), "$1") // Bold
+            .replace(Regex("\\*(.*?)\\*"), "$1") // Italic
+            .replace(Regex("~~(.*?)~~"), "$1") // Strikethrough
+            .replace(Regex("`(.*?)`"), "$1") // Inline code
+            .replace(Regex("\\[([^\\]]+)\\]\\([^\\)]+\\)"), "$1") // Links
+            .replace(Regex("^[-*+]\\s+", RegexOption.MULTILINE), "") // List items
+            .replace(Regex("^\\d+\\.\\s+", RegexOption.MULTILINE), "") // Numbered lists
+            .replace(Regex("^>\\s*", RegexOption.MULTILINE), "") // Blockquotes
+            .trim()
+    }
+
     private fun splitContentOptimized(content: String, fontSize: Float = 16f): List<String> {
         try {
-            // Calculate characters per page based on font size
-            val baseCharsPerPage = 1000 // Conservative base for better performance
+            // Calculate characters per page based on font size and screen metrics
+            val baseCharsPerPage = calculateBaseCharsPerPage()
             val fontMultiplier = when {
                 fontSize <= 12f -> 1.6f
                 fontSize <= 14f -> 1.3f
@@ -289,8 +435,18 @@ class ReadingViewModel @Inject constructor(
         }
     }
 
+    private fun calculateBaseCharsPerPage(): Int {
+        // Calculate based on screen metrics
+        val screenArea = currentScreenMetrics.width * currentScreenMetrics.height
+        return when {
+            screenArea > 2_000_000 -> 1200 // Large screens
+            screenArea > 1_000_000 -> 1000 // Medium screens
+            else -> 800 // Small screens
+        }
+    }
+
     private fun splitContentSimple(content: String, fontSize: Float = 16f): List<String> {
-        val baseCharsPerPage = 1000
+        val baseCharsPerPage = calculateBaseCharsPerPage()
         val fontMultiplier = when {
             fontSize <= 12f -> 1.5f
             fontSize <= 16f -> 1.0f
@@ -322,49 +478,6 @@ class ReadingViewModel @Inject constructor(
         }
 
         return pages.ifEmpty { listOf("No content available") }
-    }
-
-    private fun loadBookContent(book: Book): String? {
-        return try {
-            when (book.format) {
-                com.example.ebookreader.domain.model.BookFormat.TXT -> {
-                    // Check if it's a file path (new system) or URI (old system)
-                    if (book.filePath.startsWith("/")) {
-                        // New system: file stored in app-private storage
-                        val file = File(book.filePath)
-                        if (file.exists()) {
-                            file.readText()
-                        } else {
-                            "File not found. The book may have been moved or deleted."
-                        }
-                    } else {
-                        // Old system: URI-based (try with permissions)
-                        val uri = Uri.parse(book.fileUri ?: book.filePath)
-
-                        try {
-                            context.contentResolver.takePersistableUriPermission(
-                                uri,
-                                android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
-                            )
-                        } catch (e: Exception) {
-                            // Permission not available
-                        }
-
-                        val inputStream = context.contentResolver.openInputStream(uri)
-                        inputStream?.bufferedReader()?.use { it.readText() }
-                            ?: "Could not read file. Please reimport this book from the library."
-                    }
-                }
-                else -> {
-                    // For other formats, return placeholder for now
-                    "This ${book.format.extension.uppercase()} file format is not yet fully supported.\n\nFilename: ${book.title}\nAuthor: ${book.author}\n\nFull ${book.format.extension.uppercase()} reading support will be added in a future update."
-                }
-            }
-        } catch (e: SecurityException) {
-            "Permission denied. Please reimport this book from the library."
-        } catch (e: Exception) {
-            "Error loading content: ${e.message}\n\nPlease try reimporting this book from the library."
-        }
     }
 
     private fun saveReadingProgress(currentPage: Int) {
@@ -416,6 +529,15 @@ class ReadingViewModel @Inject constructor(
         }
     }
 
+    // Jump to specific percentage
+    fun goToPercentage(percentage: Float) {
+        val currentState = _uiState.value
+        if (currentState is ReadingUiState.Success && currentState.totalPages > 0) {
+            val targetPage = ((percentage / 100f) * currentState.totalPages).toInt().coerceIn(1, currentState.totalPages)
+            goToPage(targetPage)
+        }
+    }
+
     // Get current reading progress as percentage
     fun getReadingProgressPercentage(): Int {
         val currentState = _uiState.value
@@ -426,8 +548,41 @@ class ReadingViewModel @Inject constructor(
         }
     }
 
+    // Get book information
+    fun getBookInfo(): Map<String, Any>? {
+        val currentState = _uiState.value
+        return if (currentState is ReadingUiState.Success) {
+            mapOf(
+                "title" to currentState.book.title,
+                "author" to currentState.book.author,
+                "format" to currentState.book.format.extension.uppercase(),
+                "fileSize" to currentState.book.fileSize,
+                "totalPages" to currentState.totalPages,
+                "currentPage" to currentState.currentPage,
+                "progress" to getReadingProgressPercentage(),
+                "wordsOnPage" to currentState.currentPageContent.split("\\s+".toRegex()).filter { it.isNotBlank() }.size
+            )
+        } else null
+    }
+
+    // Reset reading position to beginning
+    fun resetToBeginning() {
+        goToPage(1)
+    }
+
+    // Go to end of book
+    fun goToEnd() {
+        val currentState = _uiState.value
+        if (currentState is ReadingUiState.Success) {
+            goToPage(currentState.totalPages)
+        }
+    }
+
     override fun onCleared() {
         super.onCleared()
         // Clean up resources if needed
+        currentBook = null
+        bookContent = ""
+        pages = emptyList()
     }
 }

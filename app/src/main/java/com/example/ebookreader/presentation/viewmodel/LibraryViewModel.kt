@@ -9,6 +9,8 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.ebookreader.data.database.dao.BookDao
 import com.example.ebookreader.data.database.entities.BookEntity
+import com.example.ebookreader.data.parser.EpubParser
+import com.example.ebookreader.data.parser.extractMetadataForLibrary
 import com.example.ebookreader.domain.model.Book
 import com.example.ebookreader.domain.model.BookFormat
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -23,7 +25,8 @@ import javax.inject.Inject
 @HiltViewModel
 class LibraryViewModel @Inject constructor(
     private val bookDao: BookDao,
-    @ApplicationContext private val context: Context
+    @ApplicationContext private val context: Context,
+    private val epubParser: EpubParser
 ) : ViewModel() {
 
     private val _books = MutableStateFlow<List<Book>>(emptyList())
@@ -31,6 +34,9 @@ class LibraryViewModel @Inject constructor(
 
     private val _isImporting = MutableStateFlow(false)
     val isImporting: StateFlow<Boolean> = _isImporting.asStateFlow()
+
+    private val _importStatus = MutableStateFlow<String?>(null)
+    val importStatus: StateFlow<String?> = _importStatus.asStateFlow()
 
     init {
         loadBooks()
@@ -70,6 +76,8 @@ class LibraryViewModel @Inject constructor(
     fun importBookFromUri(uri: Uri) {
         viewModelScope.launch {
             _isImporting.value = true
+            _importStatus.value = "Starting import..."
+
             try {
                 // Grant persistent permission first (attempt)
                 try {
@@ -86,29 +94,30 @@ class LibraryViewModel @Inject constructor(
                 val fileSize = documentFile?.length() ?: 0L
                 val format = getBookFormat(fileName)
 
+                _importStatus.value = "Copying file to storage..."
+
                 // Copy file to app-private storage for permanent access
                 val copiedFilePath = copyFileToAppStorage(uri, fileName)
 
                 if (copiedFilePath == null) {
-                    // Fallback: keep original URI and hope permissions persist
+                    _importStatus.value = "Failed to copy file"
                     _isImporting.value = false
                     return@launch
                 }
 
-                // Try to extract metadata based on file type
-                val (title, author) = when (format) {
-                    BookFormat.EPUB -> extractEpubMetadata(uri, fileName)
-                    BookFormat.TXT -> extractTxtMetadata(uri, fileName)
-                    BookFormat.PDF -> extractPdfMetadata(uri, fileName)
-                    else -> extractMetadataFromFilename(fileName)
-                }
+                _importStatus.value = "Extracting metadata..."
+
+                // Use enhanced metadata extraction
+                val (title, author) = extractEnhancedMetadata(uri, fileName, format)
+
+                _importStatus.value = "Saving to database..."
 
                 val bookEntity = BookEntity(
                     id = UUID.randomUUID().toString(),
                     title = title,
                     author = author,
-                    filePath = copiedFilePath, // Use copied file path
-                    fileUri = copiedFilePath,  // Use copied file path
+                    filePath = copiedFilePath,
+                    fileUri = copiedFilePath,
                     format = format.extension,
                     fileSize = fileSize,
                     totalPages = 0,
@@ -116,8 +125,20 @@ class LibraryViewModel @Inject constructor(
                     lastReadTimestamp = System.currentTimeMillis()
                 )
                 bookDao.insertBook(bookEntity)
+
+                _importStatus.value = "Import completed successfully!"
+
+                // Clear status after a delay
+                kotlinx.coroutines.delay(2000)
+                _importStatus.value = null
+
             } catch (e: Exception) {
                 e.printStackTrace()
+                _importStatus.value = "Import failed: ${e.message}"
+
+                // Clear error after a delay
+                kotlinx.coroutines.delay(3000)
+                _importStatus.value = null
             } finally {
                 _isImporting.value = false
             }
@@ -161,20 +182,26 @@ class LibraryViewModel @Inject constructor(
             .take(100) // Limit length
     }
 
-    // EPUB metadata extraction
+    // Enhanced metadata extraction that works with all supported formats
+    private suspend fun extractEnhancedMetadata(uri: Uri, fileName: String, format: BookFormat): Pair<String, String> {
+        return when (format) {
+            BookFormat.EPUB -> {
+                extractEpubMetadata(uri, fileName)
+            }
+            BookFormat.TXT -> extractTxtMetadata(uri, fileName)
+            BookFormat.PDF -> extractPdfMetadata(uri, fileName)
+            else -> extractMetadataFromFilename(fileName)
+        }
+    }
+
+    // EPUB metadata extraction using the new parser
     private suspend fun extractEpubMetadata(uri: Uri, fileName: String): Pair<String, String> {
         return try {
-            // For now, we'll implement basic EPUB reading
-            // EPUB files are ZIP archives with metadata in META-INF/container.xml
-            // and content.opf files
-
-            // Simplified: Try to read some content and guess
-            val inputStream = context.contentResolver.openInputStream(uri)
-            inputStream?.use {
-                // For now, fall back to filename until we implement full EPUB parsing
-                extractMetadataFromFilename(fileName)
-            } ?: extractMetadataFromFilename(fileName)
+            // Use the new EPUB parser for better metadata extraction
+            epubParser.extractMetadataForLibrary(context, uri)
+                ?: extractMetadataFromFilename(fileName)
         } catch (e: Exception) {
+            e.printStackTrace()
             extractMetadataFromFilename(fileName)
         }
     }
@@ -275,6 +302,96 @@ class LibraryViewModel @Inject constructor(
         }
     }
 
+    // Add this new function for getting full EPUB content (for reading)
+    suspend fun getEpubContent(bookId: String): String? {
+        return try {
+            val bookEntity = bookDao.getBookById(bookId) ?: return null
+
+            if (bookEntity.format != "epub") return null
+
+            val content = if (bookEntity.filePath.startsWith("/")) {
+                // File stored in app-private storage
+                epubParser.parseEpubFromFile(bookEntity.filePath)
+            } else {
+                // URI-based
+                val uri = Uri.parse(bookEntity.fileUri ?: bookEntity.filePath)
+                epubParser.parseEpub(context, uri)
+            }
+
+            content?.fullText
+        } catch (e: Exception) {
+            e.printStackTrace()
+            null
+        }
+    }
+
+    // Delete book function
+    fun deleteBook(book: Book) {
+        viewModelScope.launch {
+            try {
+                // Delete file from storage if it exists
+                if (book.filePath.startsWith("/")) {
+                    val file = File(book.filePath)
+                    if (file.exists()) {
+                        file.delete()
+                    }
+                }
+
+                // Delete from database
+                bookDao.deleteBookById(book.id)
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+    }
+
+    // Toggle favorite status
+    fun toggleFavorite(book: Book) {
+        viewModelScope.launch {
+            try {
+                bookDao.updateFavoriteStatus(book.id, !book.isFavorite)
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+    }
+
+    // Search books
+    fun searchBooks(query: String) {
+        viewModelScope.launch {
+            if (query.isBlank()) {
+                loadBooks()
+            } else {
+                bookDao.searchBooks(query).collect { bookEntities ->
+                    _books.value = bookEntities.map { entity ->
+                        Book(
+                            id = entity.id,
+                            title = entity.title,
+                            author = entity.author,
+                            filePath = entity.filePath,
+                            fileUri = entity.fileUri,
+                            coverPath = entity.coverPath,
+                            format = BookFormat.values().find { it.extension == entity.format } ?: BookFormat.TXT,
+                            fileSize = entity.fileSize,
+                            totalPages = entity.totalPages,
+                            totalChapters = entity.totalChapters,
+                            readingProgress = entity.readingProgress,
+                            currentPage = entity.currentPage,
+                            lastReadTimestamp = entity.lastReadTimestamp,
+                            isFavorite = entity.isFavorite,
+                            series = entity.series,
+                            seriesNumber = entity.seriesNumber,
+                            category = entity.category,
+                            language = entity.language,
+                            createdAt = entity.createdAt,
+                            updatedAt = entity.updatedAt
+                        )
+                    }
+                }
+            }
+        }
+    }
+
     fun getStorageInfo(): String {
         return try {
             val booksDir = File(context.filesDir, "books")
@@ -319,5 +436,47 @@ class LibraryViewModel @Inject constructor(
             e.printStackTrace()
             null
         }
+    }
+
+    // Testing function for EPUB parsing (remove after testing)
+    fun testEpubParsing(uri: Uri) {
+        viewModelScope.launch {
+            try {
+                val epubContent = epubParser.parseEpub(context, uri)
+                if (epubContent != null) {
+                    println("✅ EPUB Parsing Success!")
+                    println("Title: ${epubContent.metadata.title}")
+                    println("Author: ${epubContent.metadata.author}")
+                    println("Chapters: ${epubContent.chapters.size}")
+                    println("Total text length: ${epubContent.fullText.length} characters")
+                    println("First 200 characters: ${epubContent.fullText.take(200)}")
+                } else {
+                    println("❌ EPUB Parsing Failed - returned null")
+                }
+            } catch (e: Exception) {
+                println("❌ EPUB Parsing Error: ${e.message}")
+                e.printStackTrace()
+            }
+        }
+    }
+
+    // Get library statistics
+    fun getLibraryStats(): Map<String, Any> {
+        val currentBooks = _books.value
+        val totalBooks = currentBooks.size
+        val totalSize = currentBooks.sumOf { it.fileSize }
+        val formatCounts = currentBooks.groupBy { it.format }.mapValues { it.value.size }
+        val averageProgress = if (totalBooks > 0) {
+            currentBooks.map { it.readingProgress }.average()
+        } else 0.0
+
+        return mapOf(
+            "totalBooks" to totalBooks,
+            "totalSizeBytes" to totalSize,
+            "totalSizeMB" to (totalSize / (1024 * 1024)),
+            "formatCounts" to formatCounts,
+            "averageProgress" to averageProgress,
+            "recentlyRead" to currentBooks.filter { it.lastReadTimestamp > 0 }.size
+        )
     }
 }

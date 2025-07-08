@@ -5,6 +5,7 @@ import androidx.room.Room
 import com.example.ebookreader.data.database.BookDatabase
 import com.example.ebookreader.data.database.dao.BookDao
 import com.example.ebookreader.data.database.dao.ReadingSessionDao
+import com.example.ebookreader.data.parser.EpubParser
 import dagger.Module
 import dagger.Provides
 import dagger.hilt.InstallIn
@@ -36,5 +37,9 @@ object DatabaseModule {
         return database.readingSessionDao()
     }
 
-    // Removed FileImportManager provider - it now uses @Inject constructor
+    @Provides
+    @Singleton
+    fun provideEpubParser(): EpubParser {
+        return EpubParser()
+    }
 }
