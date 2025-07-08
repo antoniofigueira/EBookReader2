@@ -10,7 +10,7 @@ import androidx.lifecycle.viewModelScope
 import com.example.ebookreader.data.database.dao.BookDao
 import com.example.ebookreader.data.database.entities.BookEntity
 import com.example.ebookreader.data.parser.EpubParser
-import com.example.ebookreader.data.parser.extractMetadataForLibrary
+//import com.example.ebookreader.data.parser.extractMetadataForLibrary
 import com.example.ebookreader.domain.model.Book
 import com.example.ebookreader.domain.model.BookFormat
 import dagger.hilt.android.lifecycle.HiltViewModel

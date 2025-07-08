@@ -1,6 +1,8 @@
 package com.example.ebookreader.presentation.ui.reader
 
 import android.view.KeyEvent
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
@@ -30,6 +32,7 @@ import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.hilt.navigation.compose.hiltViewModel
 import com.example.ebookreader.presentation.viewmodel.ReadingViewModel
 
@@ -110,14 +113,27 @@ fun ReadingScreen(
             }
 
             is ReadingUiState.Success -> {
-                ReadingContent(
-                    state = state,
-                    onBackPressed = onBackPressed,
-                    onPreviousPage = { viewModel.previousPage() },
-                    onNextPage = { viewModel.nextPage() },
-                    onFontSizeChange = { viewModel.changeFontSize(it) },
-                    onThemeChange = { viewModel.changeTheme(it) }
-                )
+                // Check if this is an EPUB file for enhanced display
+                if (state.book.format.extension == "epub") {
+                    EpubReadingContent(
+                        state = state,
+                        onBackPressed = onBackPressed,
+                        onPreviousPage = { viewModel.previousPage() },
+                        onNextPage = { viewModel.nextPage() },
+                        onFontSizeChange = { viewModel.changeFontSize(it) },
+                        onThemeChange = { viewModel.changeTheme(it) }
+                    )
+                } else {
+                    // Use traditional text-based reader for other formats
+                    TextReadingContent(
+                        state = state,
+                        onBackPressed = onBackPressed,
+                        onPreviousPage = { viewModel.previousPage() },
+                        onNextPage = { viewModel.nextPage() },
+                        onFontSizeChange = { viewModel.changeFontSize(it) },
+                        onThemeChange = { viewModel.changeTheme(it) }
+                    )
+                }
             }
         }
     }
@@ -125,7 +141,143 @@ fun ReadingScreen(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun ReadingContent(
+private fun EpubReadingContent(
+    state: ReadingUiState.Success,
+    onBackPressed: () -> Unit,
+    onPreviousPage: () -> Unit,
+    onNextPage: () -> Unit,
+    onFontSizeChange: (Float) -> Unit,
+    onThemeChange: (ReadingTheme) -> Unit
+) {
+    var showSettings by remember { mutableStateOf(false) }
+    var webView by remember { mutableStateOf<WebView?>(null) }
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        // Top App Bar
+        TopAppBar(
+            title = { Text(state.book.title, maxLines = 1) },
+            navigationIcon = {
+                IconButton(onClick = onBackPressed) {
+                    Icon(Icons.Default.ArrowBack, contentDescription = "Back")
+                }
+            },
+            actions = {
+                IconButton(onClick = { showSettings = !showSettings }) {
+                    Icon(Icons.Default.Settings, contentDescription = "Settings")
+                }
+            },
+            colors = TopAppBarDefaults.topAppBarColors(
+                containerColor = state.theme.surfaceColor,
+                titleContentColor = state.theme.textColor,
+                navigationIconContentColor = state.theme.textColor,
+                actionIconContentColor = state.theme.textColor
+            )
+        )
+
+        // WebView for HTML content
+        Box(modifier = Modifier.weight(1f)) {
+            AndroidView(
+                factory = { context ->
+                    WebView(context).apply {
+                        webViewClient = WebViewClient()
+                        settings.apply {
+                            javaScriptEnabled = false
+                            loadWithOverviewMode = true
+                            useWideViewPort = true
+                            builtInZoomControls = false
+                            displayZoomControls = false
+                        }
+                        webView = this
+                        loadDataWithBaseURL(null, state.currentPageContent, "text/html", "UTF-8", null)
+                    }
+                },
+                modifier = Modifier.fillMaxSize()
+            )
+
+            // Invisible tap zones for navigation
+            Row(modifier = Modifier.fillMaxSize()) {
+                // Left tap zone (Previous page)
+                Box(
+                    modifier = Modifier
+                        .weight(0.3f)
+                        .fillMaxHeight()
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null
+                        ) {
+                            webView?.let { wv ->
+                                val scrollAmount = (wv.height * 0.8).toInt()
+                                wv.scrollBy(0, -scrollAmount)
+                            }
+                        }
+                )
+
+                // Center tap zone (Show/hide controls)
+                Box(
+                    modifier = Modifier
+                        .weight(0.4f)
+                        .fillMaxHeight()
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null
+                        ) {
+                            showSettings = !showSettings
+                        }
+                )
+
+                // Right tap zone (Next page)
+                Box(
+                    modifier = Modifier
+                        .weight(0.3f)
+                        .fillMaxHeight()
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null
+                        ) {
+                            webView?.let { wv ->
+                                val scrollAmount = (wv.height * 0.8).toInt()
+                                wv.scrollBy(0, scrollAmount)
+                            }
+                        }
+                )
+            }
+        }
+    }
+
+    // Settings overlay
+    if (showSettings) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color.Black.copy(alpha = 0.7f))
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null
+                ) { showSettings = false }
+        ) {
+            ReadingSettings(
+                fontSize = state.fontSize,
+                currentTheme = state.theme,
+                onFontSizeChange = { newSize ->
+                    onFontSizeChange(newSize)
+                    // Reload WebView content with new settings
+                    webView?.loadDataWithBaseURL(null, state.currentPageContent, "text/html", "UTF-8", null)
+                },
+                onThemeChange = { newTheme ->
+                    onThemeChange(newTheme)
+                    // Reload WebView content with new theme
+                    webView?.loadDataWithBaseURL(null, state.currentPageContent, "text/html", "UTF-8", null)
+                },
+                onDismiss = { showSettings = false },
+                modifier = Modifier.align(Alignment.Center)
+            )
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun TextReadingContent(
     state: ReadingUiState.Success,
     onBackPressed: () -> Unit,
     onPreviousPage: () -> Unit,

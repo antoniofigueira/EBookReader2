@@ -2,10 +2,13 @@ package com.example.ebookreader.presentation.viewmodel
 
 import android.content.Context
 import android.net.Uri
+import android.util.Base64
+import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.ebookreader.data.database.dao.BookDao
 import com.example.ebookreader.data.parser.EpubParser
+import com.example.ebookreader.data.parser.EpubContent
 import com.example.ebookreader.data.preferences.ReadingPreferences
 import com.example.ebookreader.domain.model.Book
 import com.example.ebookreader.presentation.ui.reader.ReadingUiState
@@ -34,6 +37,8 @@ class ReadingViewModel @Inject constructor(
     private var currentBook: Book? = null
     private var bookContent: String = ""
     private var pages: List<String> = emptyList()
+    private var epubContent: EpubContent? = null
+    private var isEpubFormat = false
 
     // Screen metrics for responsive design
     private var currentScreenMetrics = ScreenMetrics()
@@ -56,6 +61,34 @@ class ReadingViewModel @Inject constructor(
                 // They will be applied when a book is loaded
             } catch (e: Exception) {
                 // Handle preference loading errors gracefully
+            }
+        }
+    }
+
+    // Define saveReadingProgress function first
+    private fun saveReadingProgress(currentPage: Int) {
+        viewModelScope.launch {
+            try {
+                currentBook?.let { book ->
+                    val progress = if (isEpubFormat && epubContent != null) {
+                        // For EPUB, calculate progress based on chapter count
+                        currentPage.toFloat() / (epubContent!!.chapters.size + 1).toFloat()
+                    } else if (pages.isNotEmpty()) {
+                        // For regular text, calculate based on pages
+                        currentPage.toFloat() / pages.size.toFloat()
+                    } else {
+                        0f
+                    }
+
+                    bookDao.updateReadingProgress(
+                        book.id,
+                        progress,
+                        currentPage,
+                        System.currentTimeMillis()
+                    )
+                }
+            } catch (e: Exception) {
+                Log.e("ReadingViewModel", "Error saving reading progress", e)
             }
         }
     }
@@ -98,9 +131,7 @@ class ReadingViewModel @Inject constructor(
                 )
 
                 currentBook = book
-
-                // Load book content based on format
-                bookContent = loadBookContent(book) ?: "Could not load book content"
+                isEpubFormat = book.format == com.example.ebookreader.domain.model.BookFormat.EPUB
 
                 // Load saved preferences
                 val savedFontSize = readingPreferences.fontSize.first()
@@ -111,20 +142,13 @@ class ReadingViewModel @Inject constructor(
                     ReadingTheme.LIGHT
                 }
 
-                // Split content into pages with saved font size
-                pages = splitContentOptimized(bookContent, savedFontSize)
-
-                // Start from saved page or beginning
-                val startPage = if (book.currentPage > 0) book.currentPage else 1
-
-                _uiState.value = ReadingUiState.Success(
-                    book = book,
-                    currentPageContent = pages.getOrNull(startPage - 1) ?: "No content available",
-                    currentPage = startPage,
-                    totalPages = pages.size,
-                    fontSize = savedFontSize,
-                    theme = savedTheme
-                )
+                if (isEpubFormat) {
+                    // Load EPUB with enhanced content
+                    loadEpubContentEnhanced(book, savedFontSize, savedTheme)
+                } else {
+                    // Load other formats as before
+                    loadRegularContent(book, savedFontSize, savedTheme)
+                }
 
             } catch (e: Exception) {
                 _uiState.value = ReadingUiState.Error("Failed to load book: ${e.message}")
@@ -132,14 +156,291 @@ class ReadingViewModel @Inject constructor(
         }
     }
 
+    private suspend fun loadEpubContentEnhanced(book: Book, fontSize: Float, theme: ReadingTheme) {
+        try {
+            Log.d("ReadingViewModel", "Loading enhanced EPUB content for: ${book.title}")
+
+            // Parse EPUB with enhanced parser
+            epubContent = if (book.filePath.startsWith("/")) {
+                Log.d("ReadingViewModel", "Loading EPUB from file path: ${book.filePath}")
+                epubParser.parseEpubFromFile(book.filePath)
+            } else {
+                Log.d("ReadingViewModel", "Loading EPUB from URI: ${book.fileUri}")
+                val uri = Uri.parse(book.fileUri ?: book.filePath)
+                epubParser.parseEpub(context, uri)
+            }
+
+            if (epubContent != null) {
+                val content = epubContent!!
+                Log.d("ReadingViewModel", "EPUB content loaded successfully")
+                Log.d("ReadingViewModel", "Chapters: ${content.chapters.size}")
+                Log.d("ReadingViewModel", "Images: ${content.images.size}")
+                Log.d("ReadingViewModel", "Has cover: ${content.metadata.coverImageData != null}")
+
+                // Create the complete HTML content with cover and proper formatting
+                val fullHtmlContent = createEpubHtmlContent(content, fontSize, theme)
+
+                // For EPUB, we don't split into pages the same way
+                // Instead, we provide the full HTML content
+                val startPage = if (book.currentPage > 0) book.currentPage else 1
+
+                _uiState.value = ReadingUiState.Success(
+                    book = book,
+                    currentPageContent = fullHtmlContent,
+                    currentPage = startPage,
+                    totalPages = content.chapters.size + 1, // +1 for cover
+                    fontSize = fontSize,
+                    theme = theme
+                )
+            } else {
+                Log.e("ReadingViewModel", "EPUB parsing returned null")
+                _uiState.value = ReadingUiState.Error("Could not parse EPUB content. The file may be corrupted or use an unsupported EPUB variant.")
+            }
+        } catch (e: Exception) {
+            Log.e("ReadingViewModel", "Error loading EPUB content", e)
+            _uiState.value = ReadingUiState.Error("Failed to load EPUB: ${e.message}")
+        }
+    }
+
+    private suspend fun loadRegularContent(book: Book, fontSize: Float, theme: ReadingTheme) {
+        // Load content based on format
+        bookContent = loadBookContent(book) ?: "Could not load book content"
+        pages = splitContentOptimized(bookContent, fontSize)
+        val startPage = if (book.currentPage > 0) book.currentPage else 1
+
+        _uiState.value = ReadingUiState.Success(
+            book = book,
+            currentPageContent = pages.getOrNull(startPage - 1) ?: "No content available",
+            currentPage = startPage,
+            totalPages = pages.size,
+            fontSize = fontSize,
+            theme = theme
+        )
+    }
+
+    private fun createEpubHtmlContent(content: EpubContent, fontSize: Float, theme: ReadingTheme): String {
+        val themeColors = when (theme) {
+            ReadingTheme.LIGHT -> Triple("#FFFFFF", "#000000", "#F5F5F5")
+            ReadingTheme.DARK -> Triple("#121212", "#E0E0E0", "#1E1E1E")
+            ReadingTheme.SEPIA -> Triple("#F4F1EA", "#5D4E37", "#EAE4D3")
+            ReadingTheme.BLACK -> Triple("#000000", "#E0E0E0", "#0D0D0D")
+        }
+
+        val (backgroundColor, textColor, surfaceColor) = themeColors
+
+        // Create cover page
+        val coverPage = if (content.metadata.coverImageData != null) {
+            val base64Cover = Base64.encodeToString(content.metadata.coverImageData, Base64.DEFAULT)
+            """
+                <div class="cover-page">
+                    <img src="data:image/jpeg;base64,$base64Cover" class="cover-image" alt="Cover" />
+                    <div class="title">${content.metadata.title}</div>
+                    <div class="author">by ${content.metadata.author}</div>
+                    ${content.metadata.description?.let { "<div class=\"description\">$it</div>" } ?: ""}
+                </div>
+            """
+        } else {
+            """
+                <div class="cover-page">
+                    <div class="title">${content.metadata.title}</div>
+                    <div class="author">by ${content.metadata.author}</div>
+                    ${content.metadata.description?.let { "<div class=\"description\">$it</div>" } ?: ""}
+                </div>
+            """
+        }
+
+        // Create chapters with proper formatting
+        val chaptersHtml = content.chapters.joinToString("\n") { chapter ->
+            """
+                <div class="chapter">
+                    <h2 class="chapter-title">${chapter.title}</h2>
+                    ${chapter.htmlContent}
+                </div>
+            """
+        }
+
+        return """
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+                <style>
+                    body {
+                        font-family: 'Roboto', Georgia, serif;
+                        font-size: ${fontSize}px;
+                        line-height: 1.6;
+                        margin: 0;
+                        padding: 16px;
+                        background-color: $backgroundColor;
+                        color: $textColor;
+                        max-width: 100%;
+                        word-wrap: break-word;
+                    }
+                    
+                    .cover-page {
+                        text-align: center;
+                        padding: 40px 20px;
+                        min-height: 80vh;
+                        display: flex;
+                        flex-direction: column;
+                        justify-content: center;
+                        border-bottom: 2px solid $surfaceColor;
+                        margin-bottom: 30px;
+                    }
+                    
+                    .cover-image {
+                        max-width: 80%;
+                        max-height: 60vh;
+                        height: auto;
+                        margin: 0 auto 20px auto;
+                        border-radius: 8px;
+                        box-shadow: 0 4px 8px rgba(0,0,0,0.3);
+                    }
+                    
+                    .title {
+                        font-size: ${fontSize * 1.8}px;
+                        font-weight: bold;
+                        margin: 20px 0;
+                        color: $textColor;
+                    }
+                    
+                    .author {
+                        font-size: ${fontSize * 1.2}px;
+                        color: $textColor;
+                        opacity: 0.8;
+                        margin-bottom: 10px;
+                    }
+                    
+                    .description {
+                        font-size: ${fontSize * 0.9}px;
+                        color: $textColor;
+                        opacity: 0.7;
+                        margin-top: 20px;
+                        max-width: 80%;
+                        margin-left: auto;
+                        margin-right: auto;
+                        line-height: 1.4;
+                    }
+                    
+                    .chapter {
+                        margin-bottom: 40px;
+                        padding-bottom: 20px;
+                    }
+                    
+                    .chapter-title {
+                        font-size: ${fontSize * 1.4}px;
+                        font-weight: bold;
+                        margin: 40px 0 20px 0;
+                        color: $textColor;
+                        border-bottom: 2px solid $surfaceColor;
+                        padding-bottom: 10px;
+                        text-align: center;
+                    }
+                    
+                    h1, h2, h3, h4, h5, h6 {
+                        color: $textColor;
+                        margin-top: 1.5em;
+                        margin-bottom: 0.5em;
+                        font-weight: bold;
+                    }
+                    
+                    h1 { font-size: ${fontSize * 1.6}px; }
+                    h2 { font-size: ${fontSize * 1.4}px; }
+                    h3 { font-size: ${fontSize * 1.2}px; }
+                    h4 { font-size: ${fontSize * 1.1}px; }
+                    h5, h6 { font-size: ${fontSize}px; }
+                    
+                    p {
+                        text-align: justify;
+                        margin-bottom: 1em;
+                        text-indent: 1.5em;
+                        line-height: 1.6;
+                    }
+                    
+                    .first-paragraph {
+                        text-indent: 0;
+                    }
+                    
+                    img {
+                        max-width: 100%;
+                        height: auto;
+                        display: block;
+                        margin: 20px auto;
+                        border-radius: 4px;
+                    }
+                    
+                    blockquote {
+                        border-left: 4px solid $surfaceColor;
+                        margin: 1em 0;
+                        padding: 1em;
+                        background-color: $surfaceColor;
+                        font-style: italic;
+                        border-radius: 4px;
+                    }
+                    
+                    ul, ol {
+                        margin: 1em 0;
+                        padding-left: 2em;
+                    }
+                    
+                    li {
+                        margin-bottom: 0.5em;
+                        line-height: 1.4;
+                    }
+                    
+                    em { font-style: italic; }
+                    strong, b { font-weight: bold; }
+                    
+                    .center { text-align: center; }
+                    .right { text-align: right; }
+                    
+                    table {
+                        width: 100%;
+                        border-collapse: collapse;
+                        margin: 1em 0;
+                    }
+                    
+                    td, th {
+                        border: 1px solid $surfaceColor;
+                        padding: 8px;
+                        text-align: left;
+                    }
+                    
+                    th {
+                        background-color: $surfaceColor;
+                        font-weight: bold;
+                    }
+                    
+                    /* Smooth scrolling */
+                    html {
+                        scroll-behavior: smooth;
+                    }
+                </style>
+            </head>
+            <body>
+                $coverPage
+                $chaptersHtml
+            </body>
+            </html>
+        """
+    }
+
     fun nextPage() {
         val currentState = _uiState.value
         if (currentState is ReadingUiState.Success && currentState.currentPage < currentState.totalPages) {
             val newPage = currentState.currentPage + 1
-            _uiState.value = currentState.copy(
-                currentPageContent = pages.getOrNull(newPage - 1) ?: "",
-                currentPage = newPage
-            )
+
+            if (isEpubFormat) {
+                // For EPUB, just update page counter (scrolling is handled by WebView)
+                _uiState.value = currentState.copy(currentPage = newPage)
+            } else {
+                // For regular text, update content
+                _uiState.value = currentState.copy(
+                    currentPageContent = pages.getOrNull(newPage - 1) ?: "",
+                    currentPage = newPage
+                )
+            }
             saveReadingProgress(newPage)
         }
     }
@@ -148,10 +449,17 @@ class ReadingViewModel @Inject constructor(
         val currentState = _uiState.value
         if (currentState is ReadingUiState.Success && currentState.currentPage > 1) {
             val newPage = currentState.currentPage - 1
-            _uiState.value = currentState.copy(
-                currentPageContent = pages.getOrNull(newPage - 1) ?: "",
-                currentPage = newPage
-            )
+
+            if (isEpubFormat) {
+                // For EPUB, just update page counter
+                _uiState.value = currentState.copy(currentPage = newPage)
+            } else {
+                // For regular text, update content
+                _uiState.value = currentState.copy(
+                    currentPageContent = pages.getOrNull(newPage - 1) ?: "",
+                    currentPage = newPage
+                )
+            }
             saveReadingProgress(newPage)
         }
     }
@@ -159,33 +467,36 @@ class ReadingViewModel @Inject constructor(
     fun changeFontSize(newSize: Float) {
         val currentState = _uiState.value
         if (currentState is ReadingUiState.Success) {
-            // Save preference immediately
             viewModelScope.launch {
                 readingPreferences.setFontSize(newSize)
             }
 
-            // Update UI immediately for instant response
-            _uiState.value = currentState.copy(fontSize = newSize)
+            if (isEpubFormat && epubContent != null) {
+                // For EPUB, regenerate HTML with new font size
+                val newHtmlContent = createEpubHtmlContent(epubContent!!, newSize, currentState.theme)
+                _uiState.value = currentState.copy(
+                    fontSize = newSize,
+                    currentPageContent = newHtmlContent
+                )
+            } else {
+                // For other formats, use existing logic
+                _uiState.value = currentState.copy(fontSize = newSize)
+                viewModelScope.launch {
+                    try {
+                        val oldTotalPages = pages.size
+                        pages = splitContentOptimized(bookContent, newSize)
+                        val progress = (currentState.currentPage - 1).toFloat() / oldTotalPages.toFloat()
+                        val newCurrentPage = ((progress * pages.size) + 1).toInt().coerceIn(1, pages.size)
 
-            // Recalculate pages in background
-            viewModelScope.launch {
-                try {
-                    val oldTotalPages = pages.size
-                    pages = splitContentOptimized(bookContent, newSize)
-
-                    // Maintain reading position proportionally
-                    val progress = (currentState.currentPage - 1).toFloat() / oldTotalPages.toFloat()
-                    val newCurrentPage = ((progress * pages.size) + 1).toInt().coerceIn(1, pages.size)
-
-                    _uiState.value = currentState.copy(
-                        currentPageContent = pages.getOrNull(newCurrentPage - 1) ?: "",
-                        currentPage = newCurrentPage,
-                        totalPages = pages.size,
-                        fontSize = newSize
-                    )
-                } catch (e: Exception) {
-                    // If recalculation fails, keep the font size change
-                    _uiState.value = currentState.copy(fontSize = newSize)
+                        _uiState.value = currentState.copy(
+                            currentPageContent = pages.getOrNull(newCurrentPage - 1) ?: "",
+                            currentPage = newCurrentPage,
+                            totalPages = pages.size,
+                            fontSize = newSize
+                        )
+                    } catch (e: Exception) {
+                        _uiState.value = currentState.copy(fontSize = newSize)
+                    }
                 }
             }
         }
@@ -194,13 +505,21 @@ class ReadingViewModel @Inject constructor(
     fun changeTheme(newTheme: ReadingTheme) {
         val currentState = _uiState.value
         if (currentState is ReadingUiState.Success) {
-            // Save preference immediately
             viewModelScope.launch {
                 readingPreferences.setTheme(newTheme.name)
             }
 
-            // Update UI immediately
-            _uiState.value = currentState.copy(theme = newTheme)
+            if (isEpubFormat && epubContent != null) {
+                // For EPUB, regenerate HTML with new theme
+                val newHtmlContent = createEpubHtmlContent(epubContent!!, currentState.fontSize, newTheme)
+                _uiState.value = currentState.copy(
+                    theme = newTheme,
+                    currentPageContent = newHtmlContent
+                )
+            } else {
+                // For other formats, use existing logic
+                _uiState.value = currentState.copy(theme = newTheme)
+            }
         }
     }
 
@@ -208,7 +527,7 @@ class ReadingViewModel @Inject constructor(
         currentScreenMetrics = ScreenMetrics(screenWidth, screenHeight, density)
 
         val currentState = _uiState.value
-        if (currentState is ReadingUiState.Success) {
+        if (currentState is ReadingUiState.Success && !isEpubFormat) {
             viewModelScope.launch {
                 try {
                     // Recalculate pages with new screen dimensions
@@ -245,7 +564,6 @@ class ReadingViewModel @Inject constructor(
                     loadEpubContent(book)
                 }
                 com.example.ebookreader.domain.model.BookFormat.PDF -> {
-                    // PDF support - placeholder for now
                     "PDF reading support coming soon!\n\nFile: ${book.title}\nAuthor: ${book.author}\n\nThis feature will be added in a future update with proper PDF rendering and text extraction."
                 }
                 com.example.ebookreader.domain.model.BookFormat.MOBI -> {
@@ -271,7 +589,6 @@ class ReadingViewModel @Inject constructor(
 
     private suspend fun loadTextFile(book: Book): String? {
         return if (book.filePath.startsWith("/")) {
-            // New system: file stored in app-private storage
             val file = File(book.filePath)
             if (file.exists()) {
                 file.readText()
@@ -279,7 +596,6 @@ class ReadingViewModel @Inject constructor(
                 "File not found. The book may have been moved or deleted."
             }
         } else {
-            // Old system: URI-based (try with permissions)
             val uri = Uri.parse(book.fileUri ?: book.filePath)
 
             try {
@@ -300,10 +616,8 @@ class ReadingViewModel @Inject constructor(
     private suspend fun loadEpubContent(book: Book): String? {
         return try {
             val epubContent = if (book.filePath.startsWith("/")) {
-                // File stored in app-private storage
                 epubParser.parseEpubFromFile(book.filePath)
             } else {
-                // URI-based
                 val uri = Uri.parse(book.fileUri ?: book.filePath)
                 epubParser.parseEpub(context, uri)
             }
@@ -353,7 +667,7 @@ class ReadingViewModel @Inject constructor(
         return html
             .replace(Regex("<script[^>]*>.*?</script>", RegexOption.DOT_MATCHES_ALL), "")
             .replace(Regex("<style[^>]*>.*?</style>", RegexOption.DOT_MATCHES_ALL), "")
-            .replace(Regex("<[^>]+>"), "")
+            .replace(Regex("<[^>]+>"), " ")
             .replace(Regex("&nbsp;"), " ")
             .replace(Regex("&amp;"), "&")
             .replace(Regex("&lt;"), "<")
@@ -380,7 +694,6 @@ class ReadingViewModel @Inject constructor(
 
     private fun splitContentOptimized(content: String, fontSize: Float = 16f): List<String> {
         try {
-            // Calculate characters per page based on font size and screen metrics
             val baseCharsPerPage = calculateBaseCharsPerPage()
             val fontMultiplier = when {
                 fontSize <= 12f -> 1.6f
@@ -394,19 +707,15 @@ class ReadingViewModel @Inject constructor(
             }
 
             val charactersPerPage = (baseCharsPerPage * fontMultiplier).toInt()
-
-            // Split by sentences and paragraphs for natural breaks
             val sentences = content.split(Regex("(?<=[.!?])\\s+"))
             val pages = mutableListOf<String>()
             var currentPage = StringBuilder()
             var currentLength = 0
 
             for (sentence in sentences) {
-                val sentenceLength = sentence.length + 1 // +1 for space
+                val sentenceLength = sentence.length + 1
 
-                // Check if adding this sentence would exceed page limit
                 if (currentLength + sentenceLength > charactersPerPage && currentPage.isNotEmpty()) {
-                    // Finish current page
                     val pageContent = currentPage.toString().trim()
                     if (pageContent.isNotEmpty()) {
                         pages.add(pageContent)
@@ -419,7 +728,6 @@ class ReadingViewModel @Inject constructor(
                 currentLength += sentenceLength
             }
 
-            // Add the final page
             if (currentPage.isNotEmpty()) {
                 val pageContent = currentPage.toString().trim()
                 if (pageContent.isNotEmpty()) {
@@ -430,18 +738,16 @@ class ReadingViewModel @Inject constructor(
             return pages.ifEmpty { listOf("No content available") }
 
         } catch (e: Exception) {
-            // Fallback to simple word-based splitting
             return splitContentSimple(content, fontSize)
         }
     }
 
     private fun calculateBaseCharsPerPage(): Int {
-        // Calculate based on screen metrics
         val screenArea = currentScreenMetrics.width * currentScreenMetrics.height
         return when {
-            screenArea > 2_000_000 -> 1200 // Large screens
-            screenArea > 1_000_000 -> 1000 // Medium screens
-            else -> 800 // Small screens
+            screenArea > 2_000_000 -> 1200
+            screenArea > 1_000_000 -> 1000
+            else -> 800
         }
     }
 
@@ -461,7 +767,7 @@ class ReadingViewModel @Inject constructor(
         var currentLength = 0
 
         for (word in words) {
-            val wordLength = word.length + 1 // +1 for space
+            val wordLength = word.length + 1
 
             if (currentLength + wordLength > charactersPerPage && currentPage.isNotEmpty()) {
                 pages.add(currentPage.toString().trim())
@@ -480,38 +786,21 @@ class ReadingViewModel @Inject constructor(
         return pages.ifEmpty { listOf("No content available") }
     }
 
-    private fun saveReadingProgress(currentPage: Int) {
-        viewModelScope.launch {
-            try {
-                currentBook?.let { book ->
-                    val progress = if (pages.isNotEmpty()) {
-                        currentPage.toFloat() / pages.size.toFloat()
-                    } else {
-                        0f
-                    }
-                    bookDao.updateReadingProgress(
-                        book.id,
-                        progress,
-                        currentPage,
-                        System.currentTimeMillis()
-                    )
-                }
-            } catch (e: Exception) {
-                // Handle database errors gracefully
-            }
-        }
-    }
-
     // Get reading statistics for current page
     fun getPageStatistics(): String? {
         val currentState = _uiState.value
         if (currentState is ReadingUiState.Success) {
-            val currentPageContent = currentState.currentPageContent
-            val words = currentPageContent.split("\\s+".toRegex()).filter { it.isNotBlank() }.size
-            val chars = currentPageContent.length
-            val estimatedReadingTime = kotlin.math.ceil(words.toDouble() / 200).toInt() // 200 words per minute
-
-            return "Words: $words • Characters: $chars • Est. time: ${estimatedReadingTime}min"
+            return if (isEpubFormat && epubContent != null) {
+                val totalChapters = epubContent!!.chapters.size
+                val totalImages = epubContent!!.images.size
+                "Chapters: $totalChapters • Images: $totalImages • Format: EPUB"
+            } else {
+                val currentPageContent = currentState.currentPageContent
+                val words = currentPageContent.split("\\s+".toRegex()).filter { it.isNotBlank() }.size
+                val chars = currentPageContent.length
+                val estimatedReadingTime = kotlin.math.ceil(words.toDouble() / 200).toInt()
+                "Words: $words • Characters: $chars • Est. time: ${estimatedReadingTime}min"
+            }
         }
         return null
     }
@@ -521,10 +810,17 @@ class ReadingViewModel @Inject constructor(
         val currentState = _uiState.value
         if (currentState is ReadingUiState.Success) {
             val targetPage = pageNumber.coerceIn(1, currentState.totalPages)
-            _uiState.value = currentState.copy(
-                currentPageContent = pages.getOrNull(targetPage - 1) ?: "",
-                currentPage = targetPage
-            )
+
+            if (isEpubFormat) {
+                // For EPUB, just update page counter (scrolling handled by WebView)
+                _uiState.value = currentState.copy(currentPage = targetPage)
+            } else {
+                // For regular text, update content
+                _uiState.value = currentState.copy(
+                    currentPageContent = pages.getOrNull(targetPage - 1) ?: "",
+                    currentPage = targetPage
+                )
+            }
             saveReadingProgress(targetPage)
         }
     }
@@ -552,17 +848,137 @@ class ReadingViewModel @Inject constructor(
     fun getBookInfo(): Map<String, Any>? {
         val currentState = _uiState.value
         return if (currentState is ReadingUiState.Success) {
+            if (isEpubFormat && epubContent != null) {
+                mapOf(
+                    "title" to currentState.book.title,
+                    "author" to currentState.book.author,
+                    "format" to "EPUB",
+                    "fileSize" to currentState.book.fileSize,
+                    "totalChapters" to epubContent!!.chapters.size,
+                    "totalImages" to epubContent!!.images.size,
+                    "hasCover" to (epubContent!!.metadata.coverImageData != null),
+                    "language" to (epubContent!!.metadata.language ?: "Unknown"),
+                    "publisher" to (epubContent!!.metadata.publisher ?: "Unknown"),
+                    "currentPage" to currentState.currentPage,
+                    "totalPages" to currentState.totalPages,
+                    "progress" to getReadingProgressPercentage()
+                )
+            } else {
+                mapOf(
+                    "title" to currentState.book.title,
+                    "author" to currentState.book.author,
+                    "format" to currentState.book.format.extension.uppercase(),
+                    "fileSize" to currentState.book.fileSize,
+                    "totalPages" to currentState.totalPages,
+                    "currentPage" to currentState.currentPage,
+                    "progress" to getReadingProgressPercentage(),
+                    "wordsOnPage" to currentState.currentPageContent.split("\\s+".toRegex()).filter { it.isNotBlank() }.size
+                )
+            }
+        } else null
+    }
+
+    // Get EPUB-specific information
+    fun getEpubInfo(): Map<String, Any>? {
+        return if (isEpubFormat && epubContent != null) {
             mapOf(
-                "title" to currentState.book.title,
-                "author" to currentState.book.author,
-                "format" to currentState.book.format.extension.uppercase(),
-                "fileSize" to currentState.book.fileSize,
-                "totalPages" to currentState.totalPages,
-                "currentPage" to currentState.currentPage,
-                "progress" to getReadingProgressPercentage(),
-                "wordsOnPage" to currentState.currentPageContent.split("\\s+".toRegex()).filter { it.isNotBlank() }.size
+                "title" to epubContent!!.metadata.title,
+                "author" to epubContent!!.metadata.author,
+                "chapters" to epubContent!!.chapters.size,
+                "images" to epubContent!!.images.size,
+                "hasCover" to (epubContent!!.metadata.coverImageData != null),
+                "language" to (epubContent!!.metadata.language ?: "Unknown"),
+                "publisher" to (epubContent!!.metadata.publisher ?: "Unknown"),
+                "description" to (epubContent!!.metadata.description ?: "No description"),
+                "tableOfContents" to epubContent!!.tableOfContents.map {
+                    mapOf("title" to it.title, "href" to it.href)
+                },
+                "chapterTitles" to epubContent!!.chapters.map { it.title }
             )
         } else null
+    }
+
+    // Get chapter navigation for EPUB
+    fun getEpubChapters(): List<String> {
+        return if (isEpubFormat && epubContent != null) {
+            listOf("Cover") + epubContent!!.chapters.map { it.title }
+        } else emptyList()
+    }
+
+    // Jump to specific chapter (EPUB only)
+    fun goToChapter(chapterIndex: Int) {
+        if (isEpubFormat && epubContent != null) {
+            val targetPage = chapterIndex + 1 // +1 for cover page
+            goToPage(targetPage)
+        }
+    }
+
+    // Search within book content
+    fun searchInBook(query: String): List<SearchResult> {
+        val results = mutableListOf<SearchResult>()
+
+        if (isEpubFormat && epubContent != null) {
+            // Search in EPUB chapters
+            epubContent!!.chapters.forEachIndexed { chapterIndex, chapter ->
+                val content = chapter.content.lowercase()
+                val queryLower = query.lowercase()
+                var startIndex = 0
+
+                while (true) {
+                    val index = content.indexOf(queryLower, startIndex)
+                    if (index == -1) break
+
+                    // Get context around the match
+                    val contextStart = (index - 50).coerceAtLeast(0)
+                    val contextEnd = (index + query.length + 50).coerceAtMost(content.length)
+                    val context = content.substring(contextStart, contextEnd)
+
+                    results.add(
+                        SearchResult(
+                            chapterTitle = chapter.title,
+                            chapterIndex = chapterIndex,
+                            pageNumber = chapterIndex + 2, // +2 for cover and 1-based indexing
+                            context = context,
+                            matchIndex = index - contextStart
+                        )
+                    )
+
+                    startIndex = index + 1
+                    if (results.size >= 50) break // Limit results
+                }
+            }
+        } else {
+            // Search in regular text pages
+            pages.forEachIndexed { pageIndex, pageContent ->
+                val content = pageContent.lowercase()
+                val queryLower = query.lowercase()
+                var startIndex = 0
+
+                while (true) {
+                    val index = content.indexOf(queryLower, startIndex)
+                    if (index == -1) break
+
+                    val contextStart = (index - 50).coerceAtLeast(0)
+                    val contextEnd = (index + query.length + 50).coerceAtMost(content.length)
+                    val context = content.substring(contextStart, contextEnd)
+
+                    results.add(
+                        SearchResult(
+                            chapterTitle = "Page ${pageIndex + 1}",
+                            chapterIndex = pageIndex,
+                            pageNumber = pageIndex + 1,
+                            context = context,
+                            matchIndex = index - contextStart
+                        )
+                    )
+
+                    startIndex = index + 1
+                    if (results.size >= 50) break
+                }
+            }
+        }
+
+        return results
     }
 
     // Reset reading position to beginning
@@ -578,11 +994,58 @@ class ReadingViewModel @Inject constructor(
         }
     }
 
+    // Toggle bookmark for current position
+    fun toggleBookmark() {
+        val currentState = _uiState.value
+        if (currentState is ReadingUiState.Success) {
+            // TODO: Implement bookmark functionality
+            Log.d("ReadingViewModel", "Bookmark toggled for page ${currentState.currentPage}")
+        }
+    }
+
+    // Get reading session statistics
+    fun getReadingSessionStats(): Map<String, Any> {
+        val currentState = _uiState.value
+        return if (currentState is ReadingUiState.Success) {
+            val startTime = System.currentTimeMillis() - (60 * 1000) // Placeholder: 1 minute ago
+            val sessionDuration = System.currentTimeMillis() - startTime
+            val pagesRead = 5 // Placeholder
+
+            mapOf(
+                "sessionDuration" to sessionDuration,
+                "pagesRead" to pagesRead,
+                "currentPage" to currentState.currentPage,
+                "totalPages" to currentState.totalPages,
+                "progressPercentage" to getReadingProgressPercentage(),
+                "estimatedTimeLeft" to estimateTimeLeft(currentState)
+            )
+        } else emptyMap()
+    }
+
+    private fun estimateTimeLeft(state: ReadingUiState.Success): Int {
+        val pagesLeft = state.totalPages - state.currentPage
+        val averageWordsPerPage = if (isEpubFormat) 300 else 250 // Estimate
+        val wordsLeft = pagesLeft * averageWordsPerPage
+        return (wordsLeft / 200) // 200 words per minute reading speed
+    }
+
     override fun onCleared() {
         super.onCleared()
-        // Clean up resources if needed
+        // Clean up resources
         currentBook = null
         bookContent = ""
         pages = emptyList()
+        epubContent = null
+        isEpubFormat = false
+        Log.d("ReadingViewModel", "ViewModel cleared and resources cleaned up")
     }
 }
+
+// Data class for search results
+data class SearchResult(
+    val chapterTitle: String,
+    val chapterIndex: Int,
+    val pageNumber: Int,
+    val context: String,
+    val matchIndex: Int
+)
